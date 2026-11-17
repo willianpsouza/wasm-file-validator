@@ -110,7 +110,7 @@ func TestVerifyHappyPath(t *testing.T) {
 	sig := ed25519.Sign(priv, report)
 
 	resp := post(t, sealedPayload(t, report, sig))
-	if !resp.Verified {
+	if !resp.Decrypted {
 		t.Errorf("Verified=false, err=%q", resp.Error)
 	}
 	if !resp.SignatureOK {
@@ -131,7 +131,7 @@ func TestVerifyBadSignature(t *testing.T) {
 	sig := ed25519.Sign(priv, []byte("different bytes")) // sign wrong data
 
 	resp := post(t, sealedPayload(t, report, sig))
-	if !resp.Verified {
+	if !resp.Decrypted {
 		t.Error("Verified should be true (decryption worked)")
 	}
 	if resp.SignatureOK {
@@ -156,7 +156,7 @@ func TestVerifyBadBase64(t *testing.T) {
 func TestVerifyShortEnvelope(t *testing.T) {
 	short := base64.StdEncoding.EncodeToString([]byte("tiny"))
 	resp := post(t, `{"payload":"`+short+`"}`)
-	if resp.Verified {
+	if resp.Decrypted {
 		t.Error("Verified should be false for short envelope")
 	}
 	if resp.Error == "" {

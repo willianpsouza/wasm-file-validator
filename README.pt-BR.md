@@ -109,6 +109,36 @@ make cover-docker   # roda tudo em container, sem instalar nada no host
 
 A CI (`.github/workflows/ci.yml`) roda a mesma porta de 80% em cada push/PR.
 
+## Limitações & evasão (leia antes de confiar no veredito)
+
+Isto é um **scanner estrutural rápido, não um parser completo**. Lacunas
+conhecidas e como o código as trata:
+
+- **Ofuscação de PDF.** Escapes hex em nomes são normalizados (`/J#61vaScript`
+  → `/JavaScript`) antes do match, mas conteúdo dentro de **FlateDecode /
+  object streams não é descomprimido**. Um payload escondido ali escapa do scan
+  de string, então a presença desses streams é sinalizada como
+  `pdf_compressed_streams` ("inspecionar no servidor") em vez de passar em
+  silêncio. Cobertura real exige um parser de PDF que descomprima objetos.
+- **Zip bombs recursivas.** Arquivos aninhados são detectados por uma sonda de
+  magic de 4 bytes (independente do nome, então `payload.bin` ainda é pego), mas
+  a detecção é **de uma camada** — uma bomba recursiva tipo 42.zip exige
+  extração com limite de profundidade e tetos rígidos de bytes/tempo. Os
+  tamanhos do diretório central do ZIP são **meramente informativos**; para
+  confirmar um mentiroso é preciso inflar de verdade com teto.
+- **Fim de arquivo de imagem.** Marcadores JPEG e blocos GIF são percorridos
+  estruturalmente até o fim real (então um `FF D9` numa miniatura ou um `0x3B`
+  como byte de dado não é confundido com o fim). Imagens truncadas ou fora do
+  padrão reportam "fim não alcançado" em vez de chutar.
+- **`decrypted` não é autenticação.** O selamento é de remetente anônimo para
+  uma chave pública, e a chave de assinatura é extraível do `.wasm`, então
+  **qualquer um pode forjar um envelope válido**. `decrypted: true` significa só
+  "selado para nós". Mantenha autenticação real (sessão/token/mTLS) e validação
+  no servidor.
+- **Sem proteção contra replay.** Um envelope capturado descriptografa de novo.
+  Em produção, vincule cada envelope a um nonce/timestamp emitido pelo servidor
+  (como AAD) e rejeite repetições.
+
 ## Criptografia, em detalhe
 
 - **Assinatura:** Ed25519 sobre os bytes canônicos do veredito em JSON.

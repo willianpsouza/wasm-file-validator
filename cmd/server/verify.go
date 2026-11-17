@@ -32,12 +32,20 @@ type sealedInner struct {
 }
 
 type verifyResponse struct {
-	Verified    bool            `json:"verified"`
+	// Decrypted means the envelope opened with our x25519 secret. It is NOT
+	// sender authentication: the seal is anonymous-sender to a public key, so
+	// anyone can craft a valid envelope. It only means "sealed to us".
+	Decrypted   bool            `json:"decrypted"`
 	SignatureOK bool            `json:"signature_ok"`
 	Report      json.RawMessage `json:"report,omitempty"`
 	Error       string          `json:"error,omitempty"`
 }
 
+// handleVerify decrypts and verifies a sealed verdict.
+//
+// No replay protection: a captured envelope can be resubmitted and will decrypt
+// again. For a real system bind each envelope to a server-issued nonce/timestamp
+// (as AAD) and reject duplicates. Out of scope for this demo.
 func handleVerify(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBody))
 	if err != nil {
@@ -80,7 +88,7 @@ func handleVerify(w http.ResponseWriter, r *http.Request) {
 	sigOK := ed25519.Verify(ed25519Pub, reportBytes, sig)
 
 	resp := verifyResponse{
-		Verified:    true, // decryption succeeded -> came through our sealed channel
+		Decrypted:   true, // opened with our secret — see field comment, not auth
 		SignatureOK: sigOK,
 		Report:      json.RawMessage(reportBytes),
 	}

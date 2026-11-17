@@ -1,10 +1,16 @@
-//! File inspection logic. Everything here is metadata / header only.
-//! It NEVER decompresses archive content and NEVER decodes image pixels,
-//! so a malicious file cannot turn validation itself into the attack.
+//! File inspection logic. Header / structural metadata only.
+//! It never inflates archive bodies (beyond a bounded 4-byte magic probe per
+//! entry) and never decodes image pixels, so a malicious file cannot turn
+//! validation itself into the attack.
+//!
+//! Known limits (see README): this is a structural scanner, not a full parser.
+//! It does not decrypt or inflate PDF object streams, does not recurse into
+//! nested archives, and relies on ZIP central-directory sizes, which are
+//! advisory. Treat verdicts as a fast first filter, not ground truth.
 
 use serde::Serialize;
 use serde_json::json;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 
 // Thresholds for zip-bomb heuristics.
 const MAX_RATIO: f64 = 100.0; // uncompressed / compressed
@@ -140,7 +146,7 @@ fn inspect_zip(data: &[u8], findings: &mut Vec<Finding>, metrics: &mut serde_jso
     let mut nested_zip = 0;
 
     for i in 0..entries {
-        let f = match archive.by_index(i) {
+        let mut f = match archive.by_index(i) {
             Ok(f) => f,
             Err(e) => {
                 findings.push(finding("suspicious", "zip_entry_error", format!("entry {i}: {e}")));
@@ -153,7 +159,14 @@ fn inspect_zip(data: &[u8], findings: &mut Vec<Finding>, metrics: &mut serde_jso
         total_comp = total_comp.saturating_add(comp);
         max_entry_unc = max_entry_unc.max(unc);
         let name = f.name().to_lowercase();
-        if name.ends_with(".zip") || name.ends_with(".jar") {
+        // Detect nested archives by content magic, not just filename — a
+        // recursive bomb renamed `payload.bin` must still be flagged. Reading a
+        // 4-byte magic inflates at most 4 bytes, so the probe cannot itself bomb.
+        let mut magic = [0u8; 4];
+        let n = f.read(&mut magic).unwrap_or(0);
+        let looks_zip = n >= 4 && (&magic == b"PK\x03\x04" || &magic == b"PK\x05\x06");
+        let named_archive = name.ends_with(".zip") || name.ends_with(".jar");
+        if looks_zip || named_archive {
             nested_zip += 1;
         }
     }
@@ -211,21 +224,21 @@ fn inspect_zip(data: &[u8], findings: &mut Vec<Finding>, metrics: &mut serde_jso
 }
 
 fn inspect_jpeg(data: &[u8], findings: &mut Vec<Finding>, metrics: &mut serde_json::Value) {
-    // SOI = FFD8, EOI = FFD9. Anything after EOI is appended data.
-    let eoi = find_subslice(data, b"\xff\xd9");
+    // Walk the marker structure to the REAL end-of-image. A bare search for the
+    // EOI byte pair (\xff\xd9) is wrong: it occurs inside EXIF thumbnails and
+    // entropy-coded scan data, which would miscompute the trailing offset.
+    let end = jpeg_end(data);
     let mut trailing = 0usize;
-    match eoi {
-        Some(pos) => {
-            let end = pos + 2;
-            trailing = data.len().saturating_sub(end);
+    match end {
+        Some(e) => {
+            trailing = data.len().saturating_sub(e);
             if trailing > 0 {
                 findings.push(finding(
                     "suspicious",
                     "jpeg_trailing_data",
                     format!("{trailing} bytes after EOI marker (possible appended payload)"),
                 ));
-                // scan the trailing region for executable/script/zip signatures
-                for f in scan_embedded_signatures(&data[end..], 0) {
+                for f in scan_embedded_signatures(&data[e..], 0) {
                     findings.push(f);
                 }
             }
@@ -233,35 +246,99 @@ fn inspect_jpeg(data: &[u8], findings: &mut Vec<Finding>, metrics: &mut serde_js
         None => findings.push(finding(
             "suspicious",
             "jpeg_no_eoi",
-            "no EOI marker found (truncated or malformed)".into(),
+            "no valid EOI reached (truncated or malformed)".into(),
         )),
     }
 
-    // scan whole buffer (past SOI) for embedded carriers inside APPn/COM segments
+    // scan whole buffer (past SOI) for carriers embedded inside APPn/COM segments
     for f in scan_embedded_signatures(data, 2) {
         findings.push(f);
     }
 
     *metrics = json!({
-        "has_eoi": eoi.is_some(),
+        "has_eoi": end.is_some(),
         "trailing_bytes": trailing,
     });
 }
 
+/// Walk JPEG markers from SOI and return the offset just past EOI, or None if
+/// the stream is malformed / never reaches EOI. Segment lengths are honored so
+/// FFD9 bytes inside thumbnails or scan data are not mistaken for the end.
+fn jpeg_end(data: &[u8]) -> Option<usize> {
+    if data.len() < 2 || data[0] != 0xFF || data[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2;
+    while i < data.len() {
+        if data[i] != 0xFF {
+            return None; // not aligned on a marker -> malformed
+        }
+        // skip fill bytes (runs of 0xFF)
+        while i < data.len() && data[i] == 0xFF {
+            i += 1;
+        }
+        if i >= data.len() {
+            return None;
+        }
+        let marker = data[i];
+        i += 1;
+        match marker {
+            0xD9 => return Some(i),            // EOI
+            0x01 | 0xD0..=0xD7 => continue,    // TEM / RSTn: no payload
+            0xDA => {
+                // SOS: skip the header, then scan entropy data to the next marker
+                if i + 1 >= data.len() {
+                    return None;
+                }
+                let len = ((data[i] as usize) << 8) | data[i + 1] as usize;
+                if len < 2 {
+                    return None;
+                }
+                i += len;
+                while i + 1 < data.len() {
+                    if data[i] == 0xFF {
+                        let b = data[i + 1];
+                        if b == 0x00 || (0xD0..=0xD7).contains(&b) {
+                            i += 2; // byte-stuffing / restart marker: part of the scan
+                            continue;
+                        }
+                        break; // a real marker starts here
+                    }
+                    i += 1;
+                }
+            }
+            _ => {
+                // marker segment with a 2-byte length
+                if i + 1 >= data.len() {
+                    return None;
+                }
+                let len = ((data[i] as usize) << 8) | data[i + 1] as usize;
+                if len < 2 {
+                    return None;
+                }
+                i += len;
+            }
+        }
+    }
+    None
+}
+
 fn inspect_gif(data: &[u8], findings: &mut Vec<Finding>, metrics: &mut serde_json::Value) {
-    // GIF trailer byte is 0x3B. Content after the LAST trailer is appended data.
-    let last_trailer = data.iter().rposition(|&b| b == 0x3b);
+    // Walk the block structure to the REAL trailer. The trailer byte 0x3B also
+    // occurs as ordinary image/data bytes, so a last-0x3B search miscomputes the
+    // trailing offset (false positives and missed appended payloads).
+    let end = gif_end(data);
     let mut trailing = 0usize;
-    match last_trailer {
-        Some(pos) => {
-            trailing = data.len().saturating_sub(pos + 1);
+    match end {
+        Some(e) => {
+            trailing = data.len().saturating_sub(e);
             if trailing > 0 {
                 findings.push(finding(
                     "suspicious",
                     "gif_trailing_data",
                     format!("{trailing} bytes after trailer (GIFAR / appended payload vector)"),
                 ));
-                for f in scan_embedded_signatures(&data[pos + 1..], 0) {
+                for f in scan_embedded_signatures(&data[e..], 0) {
                     findings.push(f);
                 }
             }
@@ -269,19 +346,77 @@ fn inspect_gif(data: &[u8], findings: &mut Vec<Finding>, metrics: &mut serde_jso
         None => findings.push(finding(
             "suspicious",
             "gif_no_trailer",
-            "no trailer byte (0x3B) found".into(),
+            "no valid trailer reached (truncated or malformed)".into(),
         )),
     }
 
-    // whole-buffer scan past the 6-byte signature for embedded carriers
     for f in scan_embedded_signatures(data, 6) {
         findings.push(f);
     }
 
     *metrics = json!({
         "version": String::from_utf8_lossy(&data[0..6.min(data.len())]),
+        "has_trailer": end.is_some(),
         "trailing_bytes": trailing,
     });
+}
+
+/// Walk GIF blocks and return the offset just past the trailer (0x3B), or None
+/// if malformed. Skips color tables and sub-block streams so a 0x3B data byte is
+/// never mistaken for the trailer.
+fn gif_end(data: &[u8]) -> Option<usize> {
+    if data.len() < 13 || !(data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a")) {
+        return None;
+    }
+    // Logical Screen Descriptor: 7 bytes at 6..13; packed flags at byte 10.
+    let packed = data[10];
+    let mut i = 13usize;
+    if packed & 0x80 != 0 {
+        i += 3 * (1usize << ((packed & 0x07) + 1)); // global color table
+    }
+    while i < data.len() {
+        match data[i] {
+            0x3B => return Some(i + 1), // trailer
+            0x21 => {
+                // extension: introducer + label, then sub-blocks
+                i += 2;
+                i = gif_skip_subblocks(data, i)?;
+            }
+            0x2C => {
+                // image descriptor: 10 bytes (separator + 9), optional local table
+                if i + 10 > data.len() {
+                    return None;
+                }
+                let lpacked = data[i + 9];
+                i += 10;
+                if lpacked & 0x80 != 0 {
+                    i += 3 * (1usize << ((lpacked & 0x07) + 1));
+                }
+                if i >= data.len() {
+                    return None;
+                }
+                i += 1; // LZW minimum code size
+                i = gif_skip_subblocks(data, i)?;
+            }
+            _ => return None, // malformed
+        }
+    }
+    None
+}
+
+/// Skip a GIF sub-block stream (length-prefixed blocks ending with a 0 length).
+fn gif_skip_subblocks(data: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        if i >= data.len() {
+            return None;
+        }
+        let len = data[i] as usize;
+        i += 1;
+        if len == 0 {
+            return Some(i); // block terminator
+        }
+        i += len;
+    }
 }
 
 /// Grab the first http(s):// URL found, up to the first delimiter.
@@ -305,7 +440,10 @@ fn first_url(data: &[u8]) -> Option<String> {
 }
 
 fn inspect_pdf(data: &[u8], findings: &mut Vec<Finding>, metrics: &mut serde_json::Value) {
-    let has = |needle: &[u8]| find_subslice(data, needle).is_some();
+    // Normalize PDF name hex escapes (/J#61vaScript -> /JavaScript) before
+    // matching, so simple name obfuscation does not evade the scan.
+    let norm = normalize_pdf_names(data);
+    let has = |needle: &[u8]| find_subslice(&norm, needle).is_some();
 
     let openaction = has(b"/OpenAction");
     let javascript = has(b"/JavaScript") || has(b"/JS");
@@ -314,6 +452,10 @@ fn inspect_pdf(data: &[u8], findings: &mut Vec<Finding>, metrics: &mut serde_jso
     let embedded = has(b"/EmbeddedFile");
     let uri = has(b"/URI") || has(b"launchURL");
     let auto = openaction || additional; // runs without a click
+
+    // Object streams / Flate-compressed content cannot be seen by a header scan;
+    // flag that blind spot so an obfuscated payload is not silently "clean".
+    let compressed = has(b"/ObjStm") || has(b"/FlateDecode");
 
     if javascript {
         // JS that auto-runs on open is the dangerous combination.
@@ -359,6 +501,15 @@ fn inspect_pdf(data: &[u8], findings: &mut Vec<Finding>, metrics: &mut serde_jso
         };
         findings.push(finding("suspicious", "pdf_outbound_url", detail));
     }
+    if compressed && !(javascript || launch || openaction || additional || embedded) {
+        findings.push(finding(
+            "suspicious",
+            "pdf_compressed_streams",
+            "compressed object streams present; a header scan cannot inspect their \
+             contents — decompress and re-check server-side"
+                .into(),
+        ));
+    }
 
     // data after the last %%EOF (incremental-update abuse / appended payload)
     let last_eof = find_last_subslice(data, b"%%EOF");
@@ -386,8 +537,37 @@ fn inspect_pdf(data: &[u8], findings: &mut Vec<Finding>, metrics: &mut serde_jso
         "has_javascript": javascript,
         "has_launch": launch,
         "has_embedded_file": embedded,
+        "has_compressed_streams": compressed,
         "trailing_bytes": trailing,
     });
+}
+
+/// Decode PDF name hex escapes (`#XX`) across the buffer so obfuscated names
+/// match. Non-escape bytes are copied unchanged.
+fn normalize_pdf_names(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        if data[i] == b'#' && i + 2 < data.len() {
+            if let (Some(h), Some(l)) = (hexval(data[i + 1]), hexval(data[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(data[i]);
+        i += 1;
+    }
+    out
+}
+
+fn hexval(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn find_last_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -440,10 +620,12 @@ mod tests {
     }
 
     // ---- jpeg ----
+    // FF D8 (SOI) · FF E0 len=7 APP0 "JFIF\0" · FF D9 (EOI)
+    const JPEG_MIN: &[u8] = b"\xff\xd8\xff\xe0\x00\x07JFIF\x00\xff\xd9";
+
     #[test]
     fn jpeg_clean() {
-        let data = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\xff\xd9";
-        let r = inspect(data);
+        let r = inspect(JPEG_MIN);
         assert_eq!(r.file_type, "jpeg");
         assert_eq!(r.verdict, "clean");
         assert!(r.findings.is_empty());
@@ -451,14 +633,22 @@ mod tests {
 
     #[test]
     fn jpeg_polyglot_with_appended_zip() {
-        let mut data = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10];
-        data.extend_from_slice(b"JFIF\x00");
-        data.extend_from_slice(&[0xff, 0xd9]); // EOI
-        data.extend_from_slice(b"PK\x03\x04payload"); // appended
+        let mut data = JPEG_MIN.to_vec();
+        data.extend_from_slice(b"PK\x03\x04payload"); // appended after EOI
         let r = inspect(&data);
         let c = codes(&r);
         assert!(c.contains(&"jpeg_trailing_data".to_string()));
         assert!(c.contains(&"embedded_zip".to_string()));
+    }
+
+    #[test]
+    fn jpeg_internal_eoi_in_segment_is_not_the_end() {
+        // APP1 (len=5) whose payload contains an FF D9 byte pair, then the real
+        // EOI. A naive first-FFD9 search would stop inside the segment.
+        let data = b"\xff\xd8\xff\xe1\x00\x05\xff\xd9\x00\xff\xd9";
+        let r = inspect(data);
+        assert_eq!(r.verdict, "clean", "internal FFD9 must be skipped");
+        assert!(!codes(&r).contains(&"jpeg_trailing_data".to_string()));
     }
 
     #[test]
@@ -468,22 +658,36 @@ mod tests {
     }
 
     // ---- gif ----
+    // "GIF89a" · LSD 7 bytes (packed=0 -> no global color table) · trailer 0x3B
+    const GIF_MIN: &[u8] = b"GIF89a\x01\x00\x01\x00\x00\x00\x00\x3b";
+
     #[test]
     fn gif_clean() {
-        let data = b"GIF89a\x01\x00\x01\x00\x00\x3b";
-        let r = inspect(data);
+        let r = inspect(GIF_MIN);
         assert_eq!(r.file_type, "gif");
         assert_eq!(r.verdict, "clean");
     }
 
     #[test]
     fn gif_gifar_trailing_pe() {
-        let mut data = b"GIF89a\x01\x00\x01\x00\x00\x3b".to_vec();
+        let mut data = GIF_MIN.to_vec();
         data.extend_from_slice(b"MZ\x90\x00 fake exe");
         let r = inspect(&data);
         let c = codes(&r);
         assert!(c.contains(&"gif_trailing_data".to_string()));
         assert!(c.contains(&"embedded_pe".to_string()));
+    }
+
+    #[test]
+    fn gif_trailing_count_correct_with_3b_in_payload() {
+        // Appended payload that itself contains 0x3B. A last-0x3B search would
+        // undercount the trailing bytes; the structural walk finds the real end.
+        let mut data = GIF_MIN.to_vec();
+        let payload = b"junk\x3bmore"; // 9 bytes, contains a 0x3B
+        data.extend_from_slice(payload);
+        let r = inspect(&data);
+        assert!(codes(&r).contains(&"gif_trailing_data".to_string()));
+        assert_eq!(r.metrics["trailing_bytes"], payload.len());
     }
 
     // ---- pdf ----
@@ -518,6 +722,22 @@ mod tests {
         assert_eq!(r.verdict, "clean");
     }
 
+    #[test]
+    fn pdf_hex_obfuscated_name_detected() {
+        // /JavaScript written as /J#61vaScript (# hex escape) must still match.
+        let data = b"%PDF-1.7\n<< /OpenAction 1 0 R >> << /S /J#61vaScript >>\n%%EOF\n";
+        let r = inspect(data);
+        assert_eq!(r.verdict, "malicious");
+        assert!(codes(&r).contains(&"pdf_javascript".to_string()));
+    }
+
+    #[test]
+    fn pdf_compressed_streams_caveat() {
+        let data = b"%PDF-1.7\n<< /Type /ObjStm /Filter /FlateDecode >>\nstream xx endstream\n%%EOF\n";
+        let r = inspect(data);
+        assert!(codes(&r).contains(&"pdf_compressed_streams".to_string()));
+    }
+
     // ---- zip ----
     fn make_zip(entries: &[(&str, usize)]) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -532,6 +752,32 @@ mod tests {
             zw.finish().unwrap();
         }
         buf
+    }
+
+    fn make_zip_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for (name, content) in entries {
+                zw.start_file(*name, opts).unwrap();
+                zw.write_all(content).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn zip_nested_detected_by_magic_not_name() {
+        let inner = make_zip(&[("a.txt", 20)]); // a real archive
+        let outer = make_zip_bytes(&[("payload.bin", &inner)]); // misleading name
+        let r = inspect(&outer);
+        assert!(
+            codes(&r).contains(&"zip_nested_archive".to_string()),
+            "nested archive must be caught by magic, not extension"
+        );
     }
 
     #[test]

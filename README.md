@@ -106,6 +106,33 @@ make cover-docker   # run the whole gate in containers, no host toolchains
 
 CI (`.github/workflows/ci.yml`) runs the same 80% gate on every push/PR.
 
+## Limitations & evasion (read before trusting a verdict)
+
+This is a fast **structural scanner, not a full parser**. Known gaps, and how the
+code handles them:
+
+- **PDF obfuscation.** Name hex-escapes are normalized (`/J#61vaScript` →
+  `/JavaScript`) before matching, but content inside **FlateDecode / object
+  streams is not inflated**. A payload hidden there evades the string scan, so
+  their presence is flagged as `pdf_compressed_streams` ("inspect server-side")
+  rather than silently passing. Real coverage needs a PDF parser that
+  decompresses objects.
+- **Recursive zip bombs.** Nested archives are detected by a bounded 4-byte
+  magic probe (name-independent, so `payload.bin` is still caught), but
+  detection is **single-layer** — a 42.zip-style recursive bomb needs
+  depth-limited extraction with hard byte/time caps. ZIP central-directory sizes
+  are **advisory**; a liar needs a capped real inflation to confirm.
+- **Image end-of-file.** JPEG markers and GIF blocks are walked structurally to
+  the true end (so an `FF D9` in a thumbnail or a `0x3B` data byte is not
+  mistaken for the end). Truncated or nonstandard images report "no valid end
+  reached" rather than guessing.
+- **`decrypted` is not authentication.** The seal is anonymous-sender to a
+  public key, and the signing key is extractable from the `.wasm`, so **anyone
+  can craft a valid envelope**. `decrypted: true` means only "sealed to us".
+  Keep real auth (session/token/mTLS) and server-side validation.
+- **No replay protection.** A captured envelope re-decrypts. In production bind
+  each envelope to a server-issued nonce/timestamp (as AAD) and reject repeats.
+
 ## Crypto, precisely
 
 - **Sign:** Ed25519 over the canonical verdict JSON bytes.

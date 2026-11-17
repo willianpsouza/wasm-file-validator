@@ -1,0 +1,10 @@
+services:
+  app:
+    build: .
+    image: wasm-file-validator
+    ports:
+      - "8099:8099"
+    environment:
+      ADDR: ":8099"
+      STATIC_DIR: "/web/static"
+    restart: unless-stopped

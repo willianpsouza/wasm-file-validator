@@ -1,0 +1,33 @@
+[package]
+name = "wasm_file_validator"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Client-side WASM validator for archives/images that signs and seals a verdict"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wasm-bindgen = "=0.2.100"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+base64 = "0.22"
+
+# crypto
+ed25519-dalek = { version = "2.1", default-features = false, features = ["rand_core"] }
+x25519-dalek = { version = "2.0", default-features = false, features = ["static_secrets"] }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+hkdf = "0.12"
+sha2 = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+# getrandom MUST use the JS backend so randomness works inside the browser
+getrandom = { version = "0.2", features = ["js"] }
+
+# archive inspection (central-directory only, never inflates)
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WASM File Validator</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --line: #272b34; --fg: #e6e8ec;
+    --muted: #9aa3b2; --accent: #6ea8fe;
+    --clean: #3fb950; --suspicious: #d29922; --malicious: #f85149;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 32px 20px 64px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--muted); margin: 0 0 24px; font-size: 14px; }
+  .warn {
+    border: 1px solid #5a4412; background: #241d0b; color: #e3c56b;
+    border-radius: 8px; padding: 10px 14px; font-size: 13px; margin-bottom: 24px;
+  }
+  #drop {
+    border: 2px dashed var(--line); border-radius: 12px; padding: 40px 20px;
+    text-align: center; cursor: pointer; transition: border-color .15s, background .15s;
+    background: var(--panel);
+  }
+  #drop.hot { border-color: var(--accent); background: #1b2230; }
+  #drop p { margin: 6px 0; color: var(--muted); }
+  #drop strong { color: var(--fg); }
+  input[type=file] { display: none; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px; margin-top: 20px;
+  }
+  .panel h2 { font-size: 14px; text-transform: uppercase; letter-spacing: .05em;
+    color: var(--muted); margin: 0 0 12px; }
+  .badge {
+    display: inline-block; padding: 3px 12px; border-radius: 999px;
+    font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: .04em;
+  }
+  .b-clean { background: rgba(63,185,80,.15); color: var(--clean); }
+  .b-suspicious { background: rgba(210,153,34,.15); color: var(--suspicious); }
+  .b-malicious { background: rgba(248,81,73,.15); color: var(--malicious); }
+  .kv { display: grid; grid-template-columns: 180px 1fr; gap: 4px 12px;
+    font-family: var(--mono); font-size: 13px; margin-top: 12px; }
+  .kv div:nth-child(odd) { color: var(--muted); }
+  ul.findings { list-style: none; padding: 0; margin: 12px 0 0; }
+  ul.findings li {
+    border-left: 3px solid var(--line); padding: 6px 12px; margin-bottom: 8px;
+    background: #12151b; border-radius: 0 6px 6px 0; font-size: 13px;
+  }
+  li.sev-malicious { border-color: var(--malicious); }
+  li.sev-suspicious { border-color: var(--suspicious); }
+  li.sev-info { border-color: var(--muted); }
+  .code { font-family: var(--mono); color: var(--accent); }
+  .ok { color: var(--clean); } .bad { color: var(--malicious); }
+  pre { background: #0b0d11; border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; overflow: auto; font-size: 12px; color: var(--muted); }
+  .hidden { display: none; }
+  .row { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>WASM File Validator</h1>
+  <p class="sub">Client-side Rust/WASM inspects the file, signs the verdict, and seals it to the backend. The Go backend decrypts, verifies the signature, and echoes the trusted verdict.</p>
+
+  <div class="warn">
+    Demo only. The Ed25519 signing key is embedded in the published <span class="code">.wasm</span> and is therefore extractable — the signature here demonstrates the mechanism, not real client authenticity. See the README.
+  </div>
+
+  <label id="drop">
+    <input type="file" id="file">
+    <p><strong>Drop a file</strong> or click to choose</p>
+    <p>zip · jpeg · gif · pdf</p>
+  </label>
+
+  <div id="status" class="panel hidden"></div>
+
+  <div id="local" class="panel hidden">
+    <h2>Client verdict (WASM)</h2>
+    <div class="row"><span>verdict</span> <span id="l-badge" class="badge"></span></div>
+    <div class="kv" id="l-kv"></div>
+    <ul class="findings" id="l-findings"></ul>
+  </div>
+
+  <div id="server" class="panel hidden">
+    <h2>Server verification (Go)</h2>
+    <div class="kv" id="s-meta"></div>
+    <pre id="s-raw"></pre>
+  </div>
+</div>
+
+<script type="module">
+import init, { validate_and_seal } from "/pkg/wasm_file_validator.js";
+
+const $ = (id) => document.getElementById(id);
+const status = $("status");
+let ready = false;
+
+(async () => {
+  try {
+    await init();
+    ready = true;
+  } catch (e) {
+    show(status, `<span class="bad">Failed to load WASM: ${e}</span>`);
+  }
+})();
+
+function show(el, html) { el.classList.remove("hidden"); if (html != null) el.innerHTML = html; }
+
+const drop = $("drop"), fileInput = $("file");
+["dragenter","dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("hot"); }));
+["dragleave","drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("hot"); }));
+drop.addEventListener("drop", e => { if (e.dataTransfer.files[0]) handle(e.dataTransfer.files[0]); });
+fileInput.addEventListener("change", e => { if (e.target.files[0]) handle(e.target.files[0]); });
+
+async function handle(file) {
+  if (!ready) { show(status, "WASM still loading…"); return; }
+  show(status, `Inspecting <strong>${file.name}</strong> (${file.size} bytes)…`);
+  $("local").classList.add("hidden");
+  $("server").classList.add("hidden");
+
+  const bytes = new Uint8Array(await file.arrayBuffer());
+
+  let out;
+  try {
+    out = JSON.parse(validate_and_seal(bytes));
+  } catch (e) {
+    show(status, `<span class="bad">WASM error: ${e}</span>`); return;
+  }
+  renderLocal(out.report);
+
+  // send only the sealed payload to the server
+  try {
+    const r = await fetch("/api/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ payload: out.payload }),
+    });
+    renderServer(await r.json());
+    show(status, `Done — payload was ${out.payload.length} base64 chars.`);
+  } catch (e) {
+    show(status, `<span class="bad">verify request failed: ${e}</span>`);
+  }
+}
+
+function badgeClass(v) { return "badge b-" + v; }
+
+function renderLocal(report) {
+  const badge = $("l-badge");
+  badge.className = badgeClass(report.verdict);
+  badge.textContent = report.verdict;
+
+  $("l-kv").innerHTML =
+    kv("file type", report.file_type) +
+    kv("size", report.size_bytes + " bytes") +
+    Object.entries(report.metrics || {}).map(([k, v]) => kv(k, fmt(v))).join("");
+
+  $("l-findings").innerHTML = (report.findings || []).map(f =>
+    `<li class="sev-${f.severity}"><span class="code">${f.code}</span> — ${f.detail}</li>`
+  ).join("") || `<li class="sev-info">no issues found</li>`;
+
+  show($("local"));
+}
+
+function renderServer(res) {
+  $("s-meta").innerHTML =
+    kv("decrypted", res.verified ? `<span class="ok">yes</span>` : `<span class="bad">no</span>`) +
+    kv("signature valid", res.signature_ok ? `<span class="ok">yes</span>` : `<span class="bad">no</span>`) +
+    (res.error ? kv("error", `<span class="bad">${res.error}</span>`) : "");
+  $("s-raw").textContent = res.report ? JSON.stringify(res.report, null, 2) : "(no report)";
+  show($("server"));
+}
+
+function kv(k, v) { return `<div>${k}</div><div>${v}</div>`; }
+function fmt(v) { return typeof v === "number" ? v.toLocaleString() : String(v); }
+</script>
+</body>
+</html>

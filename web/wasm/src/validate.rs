@@ -396,3 +396,173 @@ fn find_last_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
     }
     hay.windows(needle.len()).rposition(|w| w == needle)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    fn codes(r: &Report) -> Vec<String> {
+        r.findings.iter().map(|f| f.code.clone()).collect()
+    }
+
+    // ---- helpers ----
+    #[test]
+    fn detect_type_covers_all() {
+        assert_eq!(detect_type(b"PK\x03\x04rest"), "zip");
+        assert_eq!(detect_type(b"\xff\xd8\xffmore"), "jpeg");
+        assert_eq!(detect_type(b"GIF89a..."), "gif");
+        assert_eq!(detect_type(b"GIF87a..."), "gif");
+        assert_eq!(detect_type(b"%PDF-1.7"), "pdf");
+        assert_eq!(detect_type(b"random"), "unknown");
+    }
+
+    #[test]
+    fn subslice_and_url_helpers() {
+        assert_eq!(find_subslice(b"hello", b"ll"), Some(2));
+        assert_eq!(find_subslice(b"hello", b"zz"), None);
+        assert_eq!(find_subslice(b"hi", b""), None);
+        assert_eq!(find_last_subslice(b"a.b.c", b"."), Some(3));
+        assert_eq!(
+            first_url(b"stuff launchURL(\"https://evil.test/x\") end").as_deref(),
+            Some("https://evil.test/x")
+        );
+        assert_eq!(first_url(b"no url here"), None);
+    }
+
+    #[test]
+    fn unknown_type_flagged() {
+        let r = inspect(b"not a known file");
+        assert_eq!(r.file_type, "unknown");
+        assert_eq!(r.verdict, "suspicious");
+        assert!(codes(&r).contains(&"unknown_type".to_string()));
+    }
+
+    // ---- jpeg ----
+    #[test]
+    fn jpeg_clean() {
+        let data = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\xff\xd9";
+        let r = inspect(data);
+        assert_eq!(r.file_type, "jpeg");
+        assert_eq!(r.verdict, "clean");
+        assert!(r.findings.is_empty());
+    }
+
+    #[test]
+    fn jpeg_polyglot_with_appended_zip() {
+        let mut data = vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10];
+        data.extend_from_slice(b"JFIF\x00");
+        data.extend_from_slice(&[0xff, 0xd9]); // EOI
+        data.extend_from_slice(b"PK\x03\x04payload"); // appended
+        let r = inspect(&data);
+        let c = codes(&r);
+        assert!(c.contains(&"jpeg_trailing_data".to_string()));
+        assert!(c.contains(&"embedded_zip".to_string()));
+    }
+
+    #[test]
+    fn jpeg_missing_eoi() {
+        let r = inspect(b"\xff\xd8\xff\xe0 no end marker");
+        assert!(codes(&r).contains(&"jpeg_no_eoi".to_string()));
+    }
+
+    // ---- gif ----
+    #[test]
+    fn gif_clean() {
+        let data = b"GIF89a\x01\x00\x01\x00\x00\x3b";
+        let r = inspect(data);
+        assert_eq!(r.file_type, "gif");
+        assert_eq!(r.verdict, "clean");
+    }
+
+    #[test]
+    fn gif_gifar_trailing_pe() {
+        let mut data = b"GIF89a\x01\x00\x01\x00\x00\x3b".to_vec();
+        data.extend_from_slice(b"MZ\x90\x00 fake exe");
+        let r = inspect(&data);
+        let c = codes(&r);
+        assert!(c.contains(&"gif_trailing_data".to_string()));
+        assert!(c.contains(&"embedded_pe".to_string()));
+    }
+
+    // ---- pdf ----
+    #[test]
+    fn pdf_malicious_openaction_js() {
+        let data = b"%PDF-1.7\n<< /OpenAction 5 0 R >>\n<< /S /JavaScript /JS (app.launchURL(\"http://127.0.0.1:8080\")) >>\n%%EOF\n";
+        let r = inspect(data);
+        assert_eq!(r.file_type, "pdf");
+        assert_eq!(r.verdict, "malicious");
+        let c = codes(&r);
+        assert!(c.contains(&"pdf_javascript".to_string()));
+        assert!(c.contains(&"pdf_openaction".to_string()));
+        assert!(c.contains(&"pdf_outbound_url".to_string()));
+    }
+
+    #[test]
+    fn pdf_launch_and_embedded_and_trailing() {
+        let data = b"%PDF-1.7\n<< /Launch >> /EmbeddedFile /AA\n%%EOF\nTRAILINGBYTES";
+        let r = inspect(data);
+        let c = codes(&r);
+        assert_eq!(r.verdict, "malicious"); // launch is malicious
+        assert!(c.contains(&"pdf_launch_action".to_string()));
+        assert!(c.contains(&"pdf_embedded_file".to_string()));
+        assert!(c.contains(&"pdf_additional_actions".to_string()));
+        assert!(c.contains(&"pdf_trailing_data".to_string()));
+    }
+
+    #[test]
+    fn pdf_benign() {
+        let data = b"%PDF-1.7\n<< /Type /Catalog >>\n%%EOF\n";
+        let r = inspect(data);
+        assert_eq!(r.verdict, "clean");
+    }
+
+    // ---- zip ----
+    fn make_zip(entries: &[(&str, usize)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(Cursor::new(&mut buf));
+            let opts = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for (name, size) in entries {
+                zw.start_file(*name, opts).unwrap();
+                zw.write_all(&vec![0u8; *size]).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf
+    }
+
+    #[test]
+    fn zip_clean_small() {
+        let z = make_zip(&[("a.txt", 50)]);
+        let r = inspect(&z);
+        assert_eq!(r.file_type, "zip");
+        assert_eq!(r.verdict, "clean");
+    }
+
+    #[test]
+    fn zip_bomb_ratio_detected() {
+        // 2 MB of zeros deflates to a few hundred bytes -> ratio >> 100x
+        let z = make_zip(&[("zeros.bin", 2_000_000)]);
+        let r = inspect(&z);
+        assert_eq!(r.verdict, "malicious");
+        assert!(codes(&r).contains(&"zip_bomb_ratio".to_string()));
+    }
+
+    #[test]
+    fn zip_nested_archive_flagged() {
+        let z = make_zip(&[("inner.zip", 10), ("doc.jar", 10)]);
+        let r = inspect(&z);
+        assert!(codes(&r).contains(&"zip_nested_archive".to_string()));
+    }
+
+    #[test]
+    fn zip_parse_error() {
+        // valid magic but truncated/garbage central directory
+        let r = inspect(b"PK\x03\x04\x00\x00garbage");
+        assert_eq!(r.file_type, "zip");
+        assert!(codes(&r).iter().any(|c| c.starts_with("zip_")));
+    }
+}

@@ -103,3 +103,39 @@ fn seal_to_backend(plaintext: &[u8]) -> Result<Vec<u8>, JsValue> {
 fn js_err<E: std::fmt::Display>(e: E) -> JsValue {
     JsValue::from_str(&e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seal_structure_and_freshness() {
+        let a = seal_to_backend(b"hello world").expect("seal a");
+        let b = seal_to_backend(b"hello world").expect("seal b");
+        // envelope = ephemeral_pub(32) || nonce(24) || ciphertext(>=16 tag)
+        assert!(a.len() >= 32 + 24 + 16);
+        // fresh ephemeral key + nonce every call -> different ciphertext
+        assert_ne!(a, b);
+        assert_ne!(&a[..32], &b[..32], "ephemeral public key must differ");
+    }
+
+    #[test]
+    fn validate_and_seal_outputs_report_and_payload() {
+        let out =
+            validate_and_seal(b"%PDF-1.7\n<< /OpenAction 1 0 R >> /JavaScript\n%%EOF\n").unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["report"]["file_type"], "pdf");
+        assert_eq!(v["report"]["verdict"], "malicious");
+        assert!(v["payload"].as_str().unwrap().len() > 50);
+    }
+
+    #[test]
+    fn signs_with_embedded_key() {
+        use ed25519_dalek::{Verifier, VerifyingKey};
+        let signing = SigningKey::from_bytes(&keys_gen::ED25519_SEED);
+        let msg = b"verdict bytes";
+        let sig = signing.sign(msg);
+        let vk: VerifyingKey = signing.verifying_key();
+        assert!(vk.verify(msg, &sig).is_ok());
+    }
+}

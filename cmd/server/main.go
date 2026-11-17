@@ -17,6 +17,17 @@ func main() {
 	staticDir := env("STATIC_DIR", "web/static")
 	addr := env("ADDR", ":8099")
 
+	log.Printf("serving %s on %s", staticDir, addr)
+	srv := &http.Server{
+		Addr:              addr,
+		Handler:           newRouter(staticDir),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
+}
+
+// newRouter wires the SPA, the WASM artifact, and the verify API.
+func newRouter(staticDir string) http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
@@ -33,14 +44,7 @@ func main() {
 	// Static SPA + /pkg/*.wasm + JS glue. Serve .wasm with the correct type.
 	fs := http.FileServer(http.Dir(staticDir))
 	r.Handle("/*", wasmContentType(fs))
-
-	log.Printf("serving %s on %s", staticDir, addr)
-	srv := &http.Server{
-		Addr:              addr,
-		Handler:           r,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-	log.Fatal(srv.ListenAndServe())
+	return r
 }
 
 // wasmContentType ensures .wasm is served as application/wasm so the browser

@@ -1,5 +1,7 @@
 # WASM File Validator
 
+> [Versão em português](README.pt-BR.md)
+
 Example repo showing how to validate untrusted compressed/image files **in the
 browser** with Rust/WebAssembly, then sign and encrypt the verdict so a Go
 backend can trust it.
@@ -83,6 +85,26 @@ cd web/wasm && wasm-pack build --release --target web --out-dir ../static/pkg
 cd ../..
 go run ./cmd/server                    # http://localhost:8099
 ```
+
+## Tests & coverage
+
+Minimal test stack with an **80% coverage** gate (Go + Rust).
+
+```bash
+make keys           # generate keys_gen.* (required before testing)
+make test           # Go + Rust unit tests
+make cover          # 80% gate for Go and Rust (needs cargo-llvm-cov)
+make cover-docker   # run the whole gate in containers, no host toolchains
+```
+
+- **Go** (`cmd/server`, `cmd/genkeys`): re-creates the seal inside the test to
+  exercise `unseal`/`handleVerify`, covers routes, valid/invalid signatures and
+  malformed input.
+- **Rust** (`web/wasm`): tests every inspector (zip/jpeg/gif/pdf/unknown), the
+  helpers, and sealing (`seal_to_backend`) natively (the `getrandom` JS backend
+  is wasm-target-only, so `cargo test` runs on the host).
+
+CI (`.github/workflows/ci.yml`) runs the same 80% gate on every push/PR.
 
 ## Crypto, precisely
 
